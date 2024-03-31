@@ -12,7 +12,7 @@ const native_os = builtin.os.tag;
 const native_posix = if (native_os == .windows or native_os == .wasi) false else true;
 
 /// Child main executable command line arguments.
-args: []const []const u8,
+argv: []const []const u8,
 
 /// Expand argv[0] to the absolute path of the main executable.
 expand_arg0: if (native_posix) posix.Arg0Expand else void,
@@ -60,8 +60,7 @@ kill: ?u8 = posix.SIG.TERM,
 /// Avaialble after `spawn()` returns `error.ExecError`.
 exec_err: ?ExecError = null,
 
-gpa: mem.Allocator,
-arena: mem.Allocator,
+allocator: mem.Allocator,
 
 actions: ActionList,
 action_set: EndpointMap,
@@ -82,7 +81,11 @@ close_range: ?struct {
 
 restore_sigterm: posix.Sigaction = undefined,
 
-must_wait: bool = false,
+// internal milestones
+did: packed struct {
+    fork: bool = false,
+    wait: bool = false,
+} = .{},
 
 const ArgList = std.ArrayList([]const u8);
 const ActionList = std.ArrayList(*Action);
@@ -91,37 +94,40 @@ const EndpointMap = std.AutoArrayHashMap(Endpoint.Handle, *const Action);
 const ExecError = @typeInfo(@typeInfo(@TypeOf(exec)).Fn.return_type.?).ErrorUnion.error_set;
 const HandleList = std.ArrayList(Endpoint.Handle);
 
-/// First argument in `args` is the executable.
-/// `args` contents must remain valid while Child instance is in use.
-pub fn init(gpa: mem.Allocator, args: []const []const u8) !Child {
-    debug.assert(args.len != 0);
-    const _arena = try gpa.create(std.heap.ArenaAllocator);
-    _arena.* = std.heap.ArenaAllocator.init(gpa);
-    const arena = _arena.allocator();
+/// First argument in `argv` is the executable.
+/// `argv` content memory must remain valid while Child instance is in use.
+pub fn init(allocator: mem.Allocator, argv: []const []const u8) Child {
+    debug.assert(argv.len != 0);
     return .{
         .expand_arg0 = .no_expand,
         .id = undefined,
-        .gpa = gpa,
-        .arena = arena,
-        .args = args,
-        .actions = ActionList.init(arena),
-        .action_set = EndpointMap.init(arena),
-        .collectors = CollectorList.init(arena),
-        .transient_handles = HandleList.init(arena),
-        .pipe_ends = HandleList.init(arena),
+        .allocator = allocator,
+        .argv = argv,
+        .actions = ActionList.init(allocator),
+        .action_set = EndpointMap.init(allocator),
+        .collectors = CollectorList.init(allocator),
+        .transient_handles = HandleList.init(allocator),
+        .pipe_ends = HandleList.init(allocator),
     };
 }
 
 pub fn deinit(self: *Child) void {
-    if (self.must_wait) {
+    if (self.did.fork and !self.did.wait) {
         if (self.kill) |sig| posix.kill(self.id, sig) catch {};
         _ = self.wait() catch {};
     }
+
     for (self.pipe_ends.items) |h| posix.close(h);
     for (self.transient_handles.items) |h| posix.close(h);
-    const _arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(self.arena.ptr));
-    _arena.deinit();
-    self.gpa.destroy(_arena);
+
+    self.pipe_ends.deinit();
+    self.transient_handles.deinit();
+
+    for (self.collectors.items) |collector| self.allocator.destroy(collector);
+    self.collectors.deinit();
+    self.action_set.deinit();
+    for (self.actions.items) |action| self.allocator.destroy(action);
+    self.actions.deinit();
 }
 
 /// Prior to exec, the child `endpoint` is marked to be inherited by child.
@@ -205,7 +211,7 @@ pub fn setUserName(self: *Child, name: []const u8) !void {
 /// Must be called after `spawn()` and before `wait()` to collect endpoint output.
 /// If `max_bytes` is exceeded for any pipe-end, all collection stops and `error.StdoutStreamTooLong` is returned.
 pub fn collect(self: *Child) !void {
-    return Child.collectMany(self.gpa, &.{self.*});
+    return Child.collectMany(self.allocator, &.{self.*});
 }
 
 /// Collect output from multiple children.
@@ -292,13 +298,13 @@ pub fn spawn(self: *Child) SpawnError!void {
 
     debug.assert(self.cwd == null or self.cwd_dir == null);
 
-    var _arena = std.heap.ArenaAllocator.init(self.gpa);
+    var _arena = std.heap.ArenaAllocator.init(self.allocator);
     defer _arena.deinit();
     const arena = _arena.allocator();
 
-    // Null-terminate args.
-    const argv = try arena.allocSentinel(?[*:0]const u8, self.args.len, null);
-    for (self.args, 0..) |arg, i| argv[i] = (try arena.dupeZ(u8, arg)).ptr;
+    // Null-terminate argv.
+    const argv = try arena.allocSentinel(?[*:0]const u8, self.argv.len, null);
+    for (self.argv, 0..) |arg, i| argv[i] = (try arena.dupeZ(u8, arg)).ptr;
 
     // Null-terminate env.
     const Envp = [*:null]const ?[*:0]const u8;
@@ -386,6 +392,7 @@ pub fn spawn(self: *Child) SpawnError!void {
     defer if (echan1_open) echan.io[1].close();
 
     const pid_result = try posix.fork();
+    self.did.fork = true;
 
     if (pid_result == 0) self.exec(envp, argv) catch |err| {
         // We are the child and tripped an error before or at callsite of `execve()`
@@ -421,8 +428,6 @@ pub fn spawn(self: *Child) SpawnError!void {
         self.exec_err = @as(ExecError, @errorCast(@errorFromInt(@as(ErrorInt, @intCast(mem.readVarInt(u64, buf[0..nbytes], .little))))));
         return error.ExecError;
     }
-
-    self.must_wait = true;
 }
 
 pub fn spawnAndWait(self: *Child) SpawnError!Term {
@@ -444,7 +449,7 @@ pub fn run(
         expand_arg0: posix.Arg0Expand = .no_expand,
     },
 ) RunError!RunResult {
-    var child = try Child.init(config.allocator, config.argv);
+    var child = Child.init(config.allocator, config.argv);
     defer child.deinit();
 
     child.expand_arg0 = config.expand_arg0;
@@ -483,9 +488,10 @@ pub fn kill(self: *Child) !Term {
 
 /// Blocks until child process terminates and then cleans up all resources.
 pub fn wait(self: *Child) !Term {
-    debug.assert(self.exec_err == null);
-    debug.assert(self.must_wait);
-    self.must_wait = false;
+    debug.assert(!self.did.wait);
+    debug.assert(self.did.fork);
+
+    self.did.wait = true;
     defer self.id = undefined;
 
     // Close all pipe-ends that were returned to user.
@@ -634,7 +640,7 @@ pub const Term = union(enum) {
 };
 
 fn addAction(self: *Child, key: Endpoint.Handle, action: Action) !void {
-    const new = try self.arena.create(Action);
+    const new = try self.allocator.create(Action);
     new.* = action;
 
     const entry = try self.action_set.getOrPut(key);
@@ -645,7 +651,7 @@ fn addAction(self: *Child, key: Endpoint.Handle, action: Action) !void {
 }
 
 fn addCollect(self: *Child, pipe_end: std.fs.File, buffer: *std.ArrayList(u8), max_bytes: ?usize) !void {
-    const new = try self.arena.create(Collector);
+    const new = try self.allocator.create(Collector);
     new.* = .{
         .pipe_end = pipe_end,
         .buffer = buffer,
@@ -869,7 +875,7 @@ fn bar() !void {
     }
     try env.put("MIKE", "WAS HERE");
 
-    var child = try Child.init(arena, &.{"env"});
+    var child = Child.init(arena, &.{"env"});
     defer child.deinit();
     child.env = &env;
     try child.spawn();

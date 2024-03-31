@@ -26,7 +26,7 @@ test "pre-exec error.NotDir" {
 
 fn pre_exec(args: []const []const u8, expect_err: anyerror) !void {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, args);
+    var child = Child.init(testing.allocator, args);
     defer child.deinit();
     child.spawn() catch |err| if (err != error.ExecError) return err;
     try testing.expectEqual(expect_err, child.exec_err.?);
@@ -42,7 +42,7 @@ test "exit fail" {
 
 fn exit(args: []const []const u8, exit_code: u8) !void {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, args);
+    var child = Child.init(testing.allocator, args);
     defer child.deinit();
     try child.spawn();
     const term = try child.wait();
@@ -55,7 +55,7 @@ test "signal" {
     // kern/58091: after fork/execve or posix_spawn, parent kill(child, SIGTERM) has race condition making it unreliable
     if (native_os == .netbsd) return error.SkipZigTest;
 
-    var child = try Child.init(testing.allocator, &.{ "/bin/sleep", "30" });
+    var child = Child.init(testing.allocator, &.{ "/bin/sleep", "30" });
     defer child.deinit();
 
     try child.spawn();
@@ -67,7 +67,7 @@ test "signal" {
 
 test "cwd, collect" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{"pwd"});
+    var child = Child.init(testing.allocator, &.{"pwd"});
     defer child.deinit();
 
     child.cwd = "/";
@@ -88,7 +88,7 @@ test "cwd, collect" {
 
 test "cwd_dir, collect" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{"pwd"});
+    var child = Child.init(testing.allocator, &.{"pwd"});
     defer child.deinit();
 
     var dir = try std.fs.cwd().openDir("/", .{});
@@ -111,7 +111,7 @@ test "cwd_dir, collect" {
 
 test "gid, collect" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "id", "-g" });
+    var child = Child.init(testing.allocator, &.{ "id", "-g" });
     defer child.deinit();
 
     child.gid = 1;
@@ -136,7 +136,7 @@ test "gid, collect" {
 
 test "uid, collect" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "id", "-u" });
+    var child = Child.init(testing.allocator, &.{ "id", "-u" });
     defer child.deinit();
 
     child.uid = 1;
@@ -161,7 +161,7 @@ test "uid, collect" {
 
 test "resource usage" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{"true"});
+    var child = Child.init(testing.allocator, &.{"true"});
     defer child.deinit();
     child.request_resource_usage_statistics = true;
     try child.spawn();
@@ -173,12 +173,12 @@ test "resource usage" {
 test "user_name, collect" {
     if (!native_posix) return error.SkipZigTest;
     const info = std.process.getUserInfo("daemon") catch return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "sh", "-c", "echo $(id -g),$(id -u); exit" });
+    var child = Child.init(testing.allocator, &.{ "sh", "-c", "echo $(id -g),$(id -u); exit" });
     defer child.deinit();
 
     try child.setUserName("daemon");
 
-    var buf = std.ArrayList(u8).init(child.arena);
+    var buf = std.ArrayList(u8).init(testing.allocator);
     defer buf.deinit();
     try child.collectEndpointInto(.stdout, &buf, default_collect_max_bytes);
 
@@ -201,7 +201,7 @@ test "user_name, collect" {
 
 test "redirect null" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
+    var child = Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
     defer child.deinit();
 
     try child.redirectEndpointTo(.stdout, .dev_null);
@@ -213,7 +213,7 @@ test "redirect null" {
 
 test "redirect create" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
+    var child = Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
     defer child.deinit();
 
     var tmp_dir = testing.tmpDir(.{});
@@ -236,7 +236,7 @@ fn tmpDirPath(allocator: mem.Allocator, tmpDir: testing.TmpDir, basename: []cons
 
 test "redirect open, null" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{"cat"});
+    var child = Child.init(testing.allocator, &.{"cat"});
     defer child.deinit();
 
     try child.redirectEndpointTo(.stdin, .{ .open, "/etc/passwd" });
@@ -249,10 +249,11 @@ test "redirect open, null" {
 
 test "collect stdout" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
+    var child = Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
     defer child.deinit();
 
-    var buf = std.ArrayList(u8).init(child.arena);
+    var buf = std.ArrayList(u8).init(testing.allocator);
+    defer buf.deinit();
     try child.collectEndpointInto(.stdout, &buf, default_collect_max_bytes);
     try child.spawn();
     try child.collect();
@@ -263,10 +264,11 @@ test "collect stdout" {
 
 test "collect stderr" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "sh", "-c", "cat /etc/passwd 1>&2; exit" });
+    var child = Child.init(testing.allocator, &.{ "sh", "-c", "cat /etc/passwd 1>&2; exit" });
     defer child.deinit();
 
-    var buf = std.ArrayList(u8).init(child.arena);
+    var buf = std.ArrayList(u8).init(testing.allocator);
+    defer buf.deinit();
     try child.collectEndpointInto(.stderr, &buf, default_collect_max_bytes);
     try child.spawn();
     try child.collect();
@@ -277,7 +279,7 @@ test "collect stderr" {
 
 test "pipe reader" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
+    var child = Child.init(testing.allocator, &.{ "cat", "/etc/passwd" });
     defer child.deinit();
 
     const stdout_pipe_end = try child.pipeEndpoint(.stdout, .source);
@@ -291,7 +293,7 @@ test "pipe reader" {
 
 test "pipe writer" {
     if (!native_posix) return error.SkipZigTest;
-    var child = try Child.init(testing.allocator, &.{ "cat", "/dev/null" });
+    var child = Child.init(testing.allocator, &.{ "cat", "/dev/null" });
     defer child.deinit();
 
     const stdin_pipe_end = try child.pipeEndpoint(.stdin, .sink);
@@ -308,8 +310,8 @@ test "pipeline" {
     if (!native_posix) return error.SkipZigTest;
 
     var child = .{
-        try Child.init(testing.allocator, &.{ "sh", "-c", "echo he__o; exit" }),
-        try Child.init(testing.allocator, &.{ "grep", "hello" }),
+        Child.init(testing.allocator, &.{ "sh", "-c", "echo he__o; exit" }),
+        Child.init(testing.allocator, &.{ "grep", "hello" }),
     };
     defer child[0].deinit();
     defer child[1].deinit();
@@ -387,7 +389,7 @@ const FdBasic = struct {
         try checker.push();
         defer checker.pop();
 
-        var child = try Child.init(testing.allocator, self.args);
+        var child = Child.init(testing.allocator, self.args);
         defer child.deinit();
         try checker.expect();
 
@@ -430,7 +432,7 @@ const FdPipeReader = struct {
         try checker.push();
         defer checker.pop();
 
-        var child = try Child.init(testing.allocator, self.args);
+        var child = Child.init(testing.allocator, self.args);
         defer child.deinit();
         try checker.expect();
 

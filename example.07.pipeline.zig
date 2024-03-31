@@ -15,8 +15,8 @@ pub fn main() !void {
     defer _arena.deinit();
 
     var childv = [_]Child{
-        try Child.init(arena, &.{ "sh", "-c", "echo he__o; exit" }),
-        try Child.init(arena, &.{ "grep", "hello" }),
+        Child.init(arena, &.{ "sh", "-c", "echo he__o; exit" }),
+        Child.init(arena, &.{ "grep", "hello" }),
     };
     defer for (&childv) |*child| child.deinit();
 

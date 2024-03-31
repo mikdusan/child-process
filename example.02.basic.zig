@@ -12,7 +12,7 @@ pub fn main() !void {
     var env = try std.process.getEnvMap(arena);
     try env.put("ULTIMATE_ANSWER", "42");
 
-    var child = try Child.init(arena, &.{ "sh", "-c", "exit $ULTIMATE_ANSWER" });
+    var child = Child.init(arena, &.{ "sh", "-c", "exit $ULTIMATE_ANSWER" });
     defer child.deinit();
 
     child.env = &env;

@@ -10,11 +10,11 @@ pub fn main() !void {
     defer _arena.deinit();
 
     var childv = [_]Child{
-        try Child.init(arena, &.{ "ls", "-l", "/." }),
-        try Child.init(arena, &.{ "ls", "-l", "/tmp/." }),
-        try Child.init(arena, &.{ "ls", "-l", "/var/tmp/." }),
-        try Child.init(arena, &.{ "ls", "-al", "/var/tmp/." }),
-        try Child.init(arena, &.{ "ls", "-l", "/bogus" }),
+        Child.init(arena, &.{ "ls", "-l", "/." }),
+        Child.init(arena, &.{ "ls", "-l", "/tmp/." }),
+        Child.init(arena, &.{ "ls", "-l", "/var/tmp/." }),
+        Child.init(arena, &.{ "ls", "-al", "/var/tmp/." }),
+        Child.init(arena, &.{ "ls", "-l", "/bogus" }),
     };
     defer for (&childv) |*child| child.deinit();
 

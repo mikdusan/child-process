@@ -8,7 +8,7 @@ pub fn main() !void {
     const arena = _arena.allocator();
     defer _arena.deinit();
 
-    var child = try Child.init(arena, &.{ "ls", "-l", "/." });
+    var child = Child.init(arena, &.{ "ls", "-l", "/." });
     defer child.deinit();
 
     var buf = std.ArrayList(u8).init(arena);

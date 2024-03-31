@@ -10,8 +10,8 @@ pub fn main() !void {
     defer _arena.deinit();
 
     var childv = [_]Child{
-        try Child.init(arena, &.{ "ls", "/." }),
-        try Child.init(arena, &.{ "wc", "-l" }),
+        Child.init(arena, &.{ "ls", "/." }),
+        Child.init(arena, &.{ "wc", "-l" }),
     };
     defer for (&childv) |*child| child.deinit();
 
@@ -20,8 +20,7 @@ pub fn main() !void {
 
     try childv[0].connect(.source, .stdout, &childv[1], .stdin);
 
-    try childv[0].spawn();
-    try childv[1].spawn();
+    for (&childv) |*child| try child.spawn();
 
     try childv[1].collect();
 
@@ -30,11 +29,8 @@ pub fn main() !void {
         std.mem.trim(u8, answer.items, " \n"),
     });
 
-    const termv = .{
-        try childv[0].wait(),
-        try childv[1].wait(),
-    };
-
-    std.log.debug("termv[0]: {}", .{termv[0]});
-    std.log.debug("termv[1]: {}", .{termv[1]});
+    for (&childv, 0..) |*child, i| {
+        try child.wait();
+        std.log.debug("termv[{}]: {}", .{i, termv[0]});
+    }
 }
