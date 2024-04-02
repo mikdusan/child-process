@@ -30,7 +30,7 @@ pub fn main() !void {
     });
 
     for (&childv, 0..) |*child, i| {
-        try child.wait();
-        std.log.debug("termv[{}]: {}", .{i, termv[0]});
+        const term = try child.wait();
+        std.log.debug("termv[{}]: {}", .{i, term});
     }
 }
