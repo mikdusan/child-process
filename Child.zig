@@ -11,6 +11,8 @@ const Child = @This();
 const native_os = builtin.os.tag;
 const native_posix = if (native_os == .windows or native_os == .wasi) false else true;
 
+/// Default behavior is to `.inherit` { `.stdin`, `.stdout`, `.stderr` }.
+
 /// Child main executable command line arguments.
 argv: []const []const u8,
 
@@ -50,7 +52,7 @@ resource_usage_statistics: ResourceUsageStatistics = .{},
 
 /// The spawned process system identifier.
 /// Valid after calling `spawn()` and before `wait()`.
-id: ID,
+id: ID = undefined,
 
 /// On deinit set signal to be sent prior to final `wait()`.
 kill: ?u8 = posix.SIG.TERM,
@@ -63,7 +65,7 @@ exec_err: ?ExecError = null,
 allocator: mem.Allocator,
 
 actions: ActionList,
-action_set: EndpointMap,
+endpoint_action_set: EndpointSet,
 collectors: CollectorList,
 transient_handles: HandleList,
 pipe_ends: HandleList,
@@ -74,10 +76,7 @@ dev_null: union(enum) {
     file: std.fs.File,
 } = .none,
 
-close_range: ?struct {
-    begin: Endpoint.Handle,
-    end: Endpoint.Handle,
-} = null,
+close_all_action: ?*Action.CloseAll = null,
 
 restore_sigterm: posix.Sigaction = undefined,
 
@@ -90,7 +89,7 @@ did: packed struct {
 const ArgList = std.ArrayList([]const u8);
 const ActionList = std.ArrayList(*Action);
 const CollectorList = std.ArrayList(*const Collector);
-const EndpointMap = std.AutoArrayHashMap(Endpoint.Handle, *const Action);
+const EndpointSet = std.AutoArrayHashMap(Endpoint.Handle, void);
 const ExecError = @typeInfo(@typeInfo(@TypeOf(exec)).Fn.return_type.?).ErrorUnion.error_set;
 const HandleList = std.ArrayList(Endpoint.Handle);
 
@@ -99,12 +98,11 @@ const HandleList = std.ArrayList(Endpoint.Handle);
 pub fn init(allocator: mem.Allocator, argv: []const []const u8) Child {
     debug.assert(argv.len != 0);
     return .{
-        .expand_arg0 = .no_expand,
-        .id = undefined,
-        .allocator = allocator,
         .argv = argv,
+        .expand_arg0 = .no_expand,
+        .allocator = allocator,
         .actions = ActionList.init(allocator),
-        .action_set = EndpointMap.init(allocator),
+        .endpoint_action_set = EndpointSet.init(allocator),
         .collectors = CollectorList.init(allocator),
         .transient_handles = HandleList.init(allocator),
         .pipe_ends = HandleList.init(allocator),
@@ -123,9 +121,11 @@ pub fn deinit(self: *Child) void {
     self.pipe_ends.deinit();
     self.transient_handles.deinit();
 
+    if (self.close_all_action) |close_all| if (close_all.skipv) |skipv| self.allocator.free(skipv);
+
     for (self.collectors.items) |collector| self.allocator.destroy(collector);
     self.collectors.deinit();
-    self.action_set.deinit();
+    self.endpoint_action_set.deinit();
     for (self.actions.items) |action| self.allocator.destroy(action);
     self.actions.deinit();
 }
@@ -133,20 +133,20 @@ pub fn deinit(self: *Child) void {
 /// Prior to exec, the child `endpoint` is marked to be inherited by child.
 pub fn inheritEndpoint(self: *Child, endpoint: anytype) !void {
     const ep = try Endpoint.fromAny(endpoint, false);
-    try self.addAction(ep.getHandle(), .{ .inherit = ep });
+    try self.addEndpointAction(ep.getHandle(), .{ .inherit = ep });
 }
 
 /// Prior to exec, the child `endpoint` is closed.
 pub fn closeEndpoint(self: *Child, endpoint: anytype) !void {
     const ep = try Endpoint.fromAny(endpoint, false);
-    try self.addAction(ep.getHandle(), .{ .close = ep });
+    try self.addEndpointAction(ep.getHandle(), .{ .close = ep });
 }
 
 /// Prior to exec, the child `endpoint` is redirected.
 pub fn redirectEndpointTo(self: *Child, endpoint: anytype, to: anytype) !void {
     const ep0 = try Endpoint.fromAny(endpoint, false);
     const ep1 = try Endpoint.fromAny(to, true);
-    try self.addAction(ep0.getHandle(), .{ .redirect = .{ .endpoint = ep0, .to = ep1 } });
+    try self.addEndpointAction(ep0.getHandle(), .{ .redirect = .{ .endpoint = ep0, .to = ep1 } });
     if (ep1 == .dev_null) self.dev_null = .pending;
 }
 
@@ -197,8 +197,14 @@ pub fn setEndpointBasicAction(self: *Child, endpoint: Endpoint, action: BasicAct
 
 /// All child endpoints not used in actions are closed.
 /// Only useful on posix systems.
+/// WARNING: This is an experimental feature and may be removed.
 pub fn closeAll(self: *Child) !void {
-    self.close_range = .{ .begin = 0, .end = 128 };
+    const end: Endpoint.Handle = @intCast((try posix.getrlimit(.NOFILE)).cur);
+    if (end == 0) return;
+    const new = try self.allocator.create(Action);
+    new.* = .{ .close_all = .{ .begin = 0, .end = end, .skipv = null }};
+    try self.actions.append(new);
+    self.close_all_action = &new.close_all;
 }
 
 /// Fetch guid/uid for user and set child process group/user IDs.
@@ -302,6 +308,26 @@ pub fn spawn(self: *Child) SpawnError!void {
     defer _arena.deinit();
     const arena = _arena.allocator();
 
+    // Default behavior: inherit stdin, stout, stderr.
+    inline for (&.{ .stdin, .stdout, .stderr }) |sym| {
+    //inline for (&.{ @as(Endpoint.Handle, 8), @as(Endpoint.Handle, 15) }) |sym| {
+        const h = (try Endpoint.fromAny(sym, false)).getHandle();
+        if (self.endpoint_action_set.get(h) == null) try self.inheritEndpoint(sym);
+    }
+
+    // Action endpoints are complete.
+    // Sort endpoint_action keys.
+    if (self.close_all_action) |close_all| {
+        const keys = self.endpoint_action_set.keys();
+        if (keys.len != 0) {
+            const skipv = try self.allocator.alloc(Endpoint.Handle, keys.len);
+            for (keys, skipv) |key, *h| h.* = key;
+            mem.sort(Endpoint.Handle, skipv, {}, Endpoint.handleLessThan);
+            // TODO: mike: in-place sort
+            close_all.skipv = skipv;
+        }
+    }
+
     // Null-terminate argv.
     const argv = try arena.allocSentinel(?[*:0]const u8, self.argv.len, null);
     for (self.argv, 0..) |arg, i| argv[i] = (try arena.dupeZ(u8, arg)).ptr;
@@ -327,7 +353,7 @@ pub fn spawn(self: *Child) SpawnError!void {
         }
     };
 
-    // One or more actions require '/dev/null'.
+    // One or more actions may require '/dev/null'.
     // At the end of spawn() parent can safely close.
     if (self.dev_null == .pending) {
         const f = std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write }) catch return error.SystemResources;
@@ -336,7 +362,7 @@ pub fn spawn(self: *Child) SpawnError!void {
     defer if (self.dev_null == .file) self.dev_null.file.close();
 
     // Replace redirect-actions `.to` which are not yet live.
-    // Doing this before fork() is a tradeoff and slighly more expensive.
+    // Before fork() is a tradeoff and slighly more expensive.
     // It's more efficient to do it after fork() but the golden rule is
     // to do as much work as possible before fork().
     defer {
@@ -639,14 +665,11 @@ pub const Term = union(enum) {
     stop: u8,
 };
 
-fn addAction(self: *Child, key: Endpoint.Handle, action: Action) !void {
+fn addEndpointAction(self: *Child, key: Endpoint.Handle, action: Action) !void {
     const new = try self.allocator.create(Action);
     new.* = action;
-
-    const entry = try self.action_set.getOrPut(key);
+    const entry = try self.endpoint_action_set.getOrPut(key);
     debug.assert(!entry.found_existing);
-    entry.value_ptr.* = new;
-
     try self.actions.append(new);
 }
 
@@ -672,12 +695,50 @@ fn exec(self: *Child, envp: [*:null]const ?[*:0]const u8, argv: [:null]?[*:0]con
             .inherit => {},
             .close => |ep| posix.close(ep.getHandle()),
             .redirect => |r| try posix.dup2(r.to.getHandle(), r.endpoint.getHandle()),
-        }
-    }
+            .close_all => |close_all| {
+                // TODO: mike: this must be disabled until we either scrap `closeAll()` feature
+                // or add posix.fcntlBadf() or similar to allow check if fd is valid
 
-    if (self.close_range) |range| {
-        var i: Endpoint.Handle = range.begin;
-        while (i < range.end) : (i += 1) if (!self.action_set.contains(i)) posix.close(i);
+                // - invariant: .end - .begin > 0
+                const skipv = close_all.skipv orelse continue;
+                // - invariant: .skipv is sorted
+                // - divide work into 3 parts
+                //  1. .begin .. .skipv[0]
+                //  2. gaps in .skipv
+                //  3. .skipv[.skipv.len - 1] + 1 .. .end
+                // part 1
+                {
+                    var i: Endpoint.Handle = close_all.begin;
+                    const max = skipv[0];
+                    while (i < max) : (i += 1) posix.close(i);
+                }
+                // part 2
+                if (skipv.len >= 2) {
+                    var i: usize = 0;
+                    const max = skipv.len - 1;
+                    while (i < max) : (i += 1) {
+                        var gap = .{
+                            skipv[i] + 1,
+                            skipv[i + 1],
+                        };
+                        // not a gap
+                        if (gap[0] == gap[1]) continue;
+                        // constrain gap to close_all range
+                        if (gap[0] < close_all.begin) gap[0] = close_all.begin;
+                        if (gap[1] > close_all.end) gap[1] = close_all.end;
+                        // gap has no length
+                        if (!(gap[1] > gap[0])) continue;
+                        for (@intCast(gap[0])..@intCast(gap[1])) |h| posix.close(@intCast(h));
+                    }
+                }
+                // part 3
+                {
+                    var i: Endpoint.Handle = skipv[skipv.len - 1] + 1;
+                    const max = close_all.end;
+                    while (i < max) : (i += 1) posix.close(i);
+                }
+            },
+        }
     }
 
     return switch (self.expand_arg0) {
@@ -699,6 +760,15 @@ const Action = union(enum) {
         endpoint: Endpoint,
         to: Endpoint,
     },
+
+    /// All unaccounted endpoints in range are closed.
+    close_all: CloseAll,
+
+    const CloseAll = struct {
+        begin: Endpoint.Handle,
+        end: Endpoint.Handle,
+        skipv: ?[]Endpoint.Handle,
+    };
 };
 
 const Collector = struct {
@@ -791,6 +861,10 @@ const Endpoint = union(enum) {
     }
 
     const Handle = std.fs.File.Handle;
+
+    fn handleLessThan(_: void, lhs: Endpoint.Handle, rhs: Endpoint.Handle) bool {
+        return lhs < rhs;
+    }
 };
 
 // TODO: mike: move to std.process and rename -> createNullDelimitedEnvironFromEnvMap()

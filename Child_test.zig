@@ -49,6 +49,16 @@ fn exit(args: []const []const u8, exit_code: u8) !void {
     try testing.expectEqual(term.exit, exit_code);
 }
 
+test "closeAll" {
+    if (true or !native_posix) return error.SkipZigTest;
+    var child = Child.init(testing.allocator, &.{ "true" });
+    defer child.deinit();
+    try child.closeAll();
+    try child.spawn();
+    const term = try child.wait();
+    try testing.expectEqual(term.exit, 0);
+}
+
 test "signal" {
     if (!native_posix) return error.SkipZigTest;
     // TODO: http://mail-index.netbsd.org/netbsd-bugs/2024/03/30/msg082251.html
@@ -360,7 +370,7 @@ test "run" {
     defer testing.allocator.free(result.stderr);
 }
 
-test "fd management, exit success" {
+test "fd-management, exit success" {
     if (native_os != .linux) return error.SkipZigTest;
 
     var main: FdBasic = .{ .args = &.{"true"}, .exit_code = 0 };
@@ -369,7 +379,7 @@ test "fd management, exit success" {
     try check.run();
 }
 
-test "fd management, exit fail" {
+test "fd-management, exit fail" {
     if (native_os != .linux) return error.SkipZigTest;
 
     var main: FdBasic = .{ .args = &.{"false"}, .exit_code = 1 };
@@ -403,7 +413,7 @@ const FdBasic = struct {
     }
 };
 
-test "fd management, pipe reader, exit success" {
+test "fd-management, pipe reader, exit success" {
     if (native_os != .linux) return error.SkipZigTest;
 
     var main: FdPipeReader = .{ .args = &.{ "cat", "/etc/passwd" }, .exit_code = 0 };
@@ -412,7 +422,7 @@ test "fd management, pipe reader, exit success" {
     try check.run();
 }
 
-test "fd management, pipe reader, exit fail" {
+test "fd-management, pipe reader, exit fail" {
     if (native_os != .linux) return error.SkipZigTest;
 
     var main: FdPipeReader = .{ .args = &.{"false"}, .exit_code = 1 };
